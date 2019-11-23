@@ -1,0 +1,165 @@
+from pynq.overlays.base import BaseOverlay
+from pynq.lib.video import *
+base = BaseOverlay("base.bit")
+
+# monitor configuration: 640*480 @ 60Hz
+Mode = VideoMode(640,480,24)
+hdmi_out = base.video.hdmi_out
+hdmi_out.configure(Mode,PIXEL_BGR)
+hdmi_out.start()
+
+# monitor (output) frame buffer size
+frame_out_w = 1920
+frame_out_h = 1080
+# camera (input) configuration
+frame_in_w = 640
+frame_in_h = 480
+
+# initialize camera from OpenCV
+import cv2
+import numpy as np
+
+videoIn = cv2.VideoCapture(0)
+videoIn.set(cv2.CAP_PROP_FRAME_WIDTH, frame_in_w);
+videoIn.set(cv2.CAP_PROP_FRAME_HEIGHT, frame_in_h);
+print("Capture device is open: " + str(videoIn.isOpened()))
+
+from pynq.lib import Pmod_PWM
+import time
+pwm_0 = Pmod_PWM(base.PMODA,0)
+pwm_1 = Pmod_PWM(base.PMODB,0)
+
+# Generate two 2.5ms clocks with 60% duty cycle
+# Duty ranging from 40% to 80%
+# On time ranging from 1ms to 2ms 
+pwm_0_period = 2500
+pwm_0_duty = 60
+pwm_1_period = 2500
+pwm_1_duty = 60
+pwm_0.generate(pwm_0_period, pwm_0_duty)
+pwm_1.generate(pwm_1_period, pwm_1_duty)
+
+from pynq.lib.arduino import arduino_io
+Charge_Pin = arduino_io.Arduino_IO(base.ARDUINO, 0, 'out')
+Fire_Pin = arduino_io.Arduino_IO(base.ARDUINO, 1, 'out')
+Charge_Pin.write(0)
+Fire_Pin.write(0)
+
+import math
+X_Pixel = 320.0;
+L = 316
+D = 373.5
+d = 42.5
+pie = 3.1415926535
+
+es = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 4)) 
+kernel = np.ones((5, 5), np.uint8) 
+background = None
+whethercharge = 0
+last_measurement = current_measurement = np.array((2, 1), np.float32)
+last_prediction = current_prediction = np.zeros((2, 1), np.float32)
+cmx = cmy = cpx = cpy = 0
+kalman = cv2.KalmanFilter(4, 2) 
+kalman.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], np.float32) 
+kalman.transitionMatrix = np.array([[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]], np.float32) 
+kalman.processNoiseCov = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]], np.float32)*0.03 
+def kalmancalc(frame, x, y) :
+    global current_measurement, measurements, last_measurement, current_prediction, last_prediction
+    global cmx, cmy, cpx, cpy
+    last_prediction = current_prediction 
+    last_measurement = current_measurement 
+    current_measurement = np.array([[np.float32(x)], [np.float32(y)]])
+    kalman.correct(current_measurement) 
+    current_prediction = kalman.predict() 
+    lmx, lmy = last_measurement[0], last_measurement[1] 
+    cmx, cmy = current_measurement[0], current_measurement[1] 
+    lpx, lpy = last_prediction[0], last_prediction[1] 
+    cpx, cpy = current_prediction[0], current_prediction[1] 
+    cv2.line(frame, (lmx, lmy), (cmx, cmy), (255, 0, 0), 3) 
+    cv2.line(frame, (lpx, lpy), (cpx, cpy), (0, 255, 255), 3) 
+
+while (videoIn.isOpened()):
+    ret, frame_vga = videoIn.read()
+    frame_vga_info = frame_vga.shape
+    frame_vga_hight = frame_vga_info[0]
+    frame_vga_weight = frame_vga_info[1]
+    frame_vga_mode = frame_vga_info[2]
+    dstHeight=int(0.5 * frame_vga_hight)
+    dstWeight=int(0.5 * frame_vga_weight)
+    frame_vga_resize = cv2.resize(frame_vga, (dstWeight, frame_vga_hight))
+    frame_vga_half = frame_vga_resize[0:240, 0:320, :]
+    gray_lwpCV = cv2.cvtColor(frame_vga_half, cv2.COLOR_BGR2GRAY)
+    gray_lwpCV = cv2.GaussianBlur(gray_lwpCV, (21, 21), 0) 
+    if background is None: 
+        background = gray_lwpCV 
+        continue  
+    diff = cv2.absdiff(background, gray_lwpCV) 
+    diff = cv2.threshold(diff, 100, 255, cv2.THRESH_BINARY)[1] 
+    diff = cv2.dilate(diff, None, iterations=2) 
+    x,y,w,h = cv2.boundingRect(diff)
+    frame_vga_half = cv2.rectangle(frame_vga_half,(x,y),(x+w,y+h),(0,0,255),2)
+    cmx = cmy = cpx = cpy = 0
+    kalmancalc(frame_vga_half, x + (int)(w / 2), y + (int)(h / 2))
+    if (cpx < (int)(X_Pixel / 2.0)) and (cpx > 0) :
+        rad = math.atan(((((X_Pixel / 2.0) - cpx) / 320) * (L / 2.0)) / (D - d))
+        pwm_0_duty = ((rad + pie / 2.0) / pie) * 40.0 + 40
+        temp = (int)(pwm_0_duty)
+        minus = (float)(pwm_0_duty - temp)
+        if (minus > 0.5) and (minus < 1) :
+            pwm_0_duty = (int)(pwm_0_duty) + 1
+        else :
+            pwm_0_duty = (int)(pwm_0_duty)
+
+    elif (cpx > (int)(X_Pixel / 2.0)) and (cpx < X_Pixel) :
+        rad = math.atan((((cpx - (X_Pixel / 2.0)) / 320) * (L / 2.0)) / (D - d))
+        pwm_0_duty = (((pie / 2.0) - rad) / pie) * 40.0 + 40
+        temp = (int)(pwm_0_duty)
+        minus = (float)(pwm_0_duty - temp)
+        if (minus > 0.5) and (minus < 1) :
+            pwm_0_duty = (int)(pwm_0_duty) + 1
+        else :
+            pwm_0_duty = (int)(pwm_0_duty)
+        
+    else :
+        pwm_0_duty = 60
+        
+    if pwm_0_duty < 40 :
+        pwm_0_duty = 40
+    elif pwm_0_duty > 80 :
+        pwm_0_duty = 80
+    else :
+        pwm_0_duty = pwm_0_duty
+                       
+    pwm_0.generate(pwm_0_period, pwm_0_duty)
+ 
+    if (cpx > 150) and (cpx < 170) :
+        Fire_Pin.write(1)
+        time.sleep(0.1)
+        Fire_Pin.write(0)
+        whethercharge = 0
+    informframe = np.zeros(frame_vga_half.shape, np.uint8)
+    bluestr_x = ("X:%.2f" % cmx)
+    bluestr_y = ("Y:%.2f" % cmy)
+    yellowstr_x = ("X:%.2f" % cpx)
+    yellowstr_y = ("Y:%.2f" % cpy)
+    pwmstr = ("Duty:%d" % pwm_0_duty)
+    
+    cv2.putText(informframe, bluestr_x, (0, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+    cv2.putText(informframe, bluestr_y, (0, 64), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+    cv2.putText(informframe, yellowstr_x, (0, 96), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+    cv2.putText(informframe, yellowstr_y, (0, 128), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+    cv2.putText(informframe, pwmstr, (0, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    if (ret) :    
+        outframe = hdmi_out.newframe()
+        outframe[0:240,0:320,:] = frame_vga_half[0:240,0:320,:]
+        outframe[0:240, 320:640, :] = informframe[0:240, 0:320, :]
+        hdmi_out.writeframe(outframe)
+    else:
+        raise RuntimeError("Failed to read from camera.")  
+
+  pwm_0.stop()
+  pwm_1.stop()
+
+  videoIn.release()
+  hdmi_out.stop()
+  del hdmi_out 
